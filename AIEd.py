@@ -1,84 +1,215 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-from datetime import datetime, timedelta
+library(shiny)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(plotly)
+library(DT)
+library(data.table)  # For faster data reading and processing
+library(shinyWidgets)  # For progress bar
 
-# Set Streamlit page configuration
-st.set_page_config(page_title="Usage Count Analysis", layout="wide")
+options(shiny.maxRequestSize = 100 * 1024^2)
 
-# Helper functions
-def load_data(file):
-    """Load and preprocess data."""
-    data = pd.read_csv(file)
-    if 'timestamp' not in data.columns:
-        st.error("The uploaded file must contain a 'timestamp' column.")
-        return None
-    # Convert timestamp column to datetime
-    data['timestamp'] = pd.to_datetime(data['timestamp'], errors='coerce')
-    if data['timestamp'].isna().any():
-        st.error("Invalid timestamp format. Ensure 'timestamp' is in ISO 8601 format.")
-        return None
-    return data
-
-def filter_and_group_data(data, date_range, time_period):
-    """Filter data by date range and group by the selected time period."""
-    filtered_data = data[(data['timestamp'] >= date_range[0]) & (data['timestamp'] <= date_range[1])]
-    if time_period == 'day':
-        filtered_data['period'] = filtered_data['timestamp'].dt.date
-    elif time_period == 'week':
-        filtered_data['period'] = filtered_data['timestamp'].dt.to_period('W').apply(lambda r: r.start_time)
-    elif time_period == 'month':
-        filtered_data['period'] = filtered_data['timestamp'].dt.to_period('M').apply(lambda r: r.start_time)
-    grouped_data = filtered_data.groupby('period').size().reset_index(name='count')
-    return grouped_data
-
-# App layout
-st.title("Usage Count Analysis")
-
-# Sidebar inputs
-uploaded_file = st.sidebar.file_uploader("Upload CSV File", type="csv")
-time_period = st.sidebar.selectbox("Select Time Period:", ["day", "week", "month"], index=0)
-start_date = st.sidebar.date_input("Start Date", value=datetime.now() - timedelta(days=30))
-end_date = st.sidebar.date_input("End Date", value=datetime.now())
-horizontal_line = st.sidebar.number_input("Horizontal Line (Default = 0):", value=0, step=1)
-
-date_range = (pd.to_datetime(start_date), pd.to_datetime(end_date))
-
-# Main panel
-if uploaded_file:
-    data = load_data(uploaded_file)
-    if data is not None:
-        # Filter and group data
-        grouped_data = filter_and_group_data(data, date_range, time_period)
-
-        # Display chart
-        st.subheader("Usage Over Time")
-        if grouped_data.empty:
-            st.warning("No data available for the selected range.")
-        else:
-            y_axis_range = st.sidebar.slider(
-                "Adjust Y-Axis Range:",
-                min_value=0,
-                max_value=int(grouped_data['count'].max() * 1.2),
-                value=(0, int(grouped_data['count'].max()))
-            )
-
-            fig = px.line(grouped_data, x='period', y='count', title="Usage Over Time")
-            fig.update_traces(mode='lines+markers')
-            fig.add_hline(y=horizontal_line, line_dash="dash", line_color="red")
-            fig.update_yaxes(range=y_axis_range)
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Display table
-        st.subheader("Data Table")
-        st.dataframe(grouped_data)
-
-        # Export button
-        st.download_button(
-            label="Export Data",
-            data=grouped_data.to_csv(index=False),
-            file_name=f"Usage_Data_{datetime.now().strftime('%Y-%m-%d')}.csv",
-            mime="text/csv"
+# Define UI
+ui <- fluidPage(
+  titlePanel("Usage Count Analysis"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload CSV File", accept = ".csv"),
+      selectInput(
+        "timePeriod", 
+        "Select Time Period:", 
+        choices = c("By Day" = "day", "By Week" = "week", "By Month" = "month"),
+        selected = "day"
+      ),
+      dateRangeInput("dateRange", "Select Date Range:",
+                     start = Sys.Date() - 30, 
+                     end = Sys.Date()),
+      numericInput("hline", "Horizontal Line (Default = 0):", value = 0, step = 1),
+      sliderInput("yAxisRange", "Adjust Y-Axis Range:",
+                  min = 0, max = 50000, value = c(0, 10000)),  # Set slider range to 0-50,000
+      actionButton("refresh", "Refresh"),
+      downloadButton("exportDetails", "Export Detailed Dataset"),
+      downloadButton("exportAggregated", "Export Aggregated Counts")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Usage Over Time",
+                 plotlyOutput("lineChart"),
+                 br(),
+                 DTOutput("dataTable")
         )
-    else:
-        st.error("Failed to process the uploaded file. Please check the file format.")
+      )
+    )
+  )
+)
+
+# Define Server Logic
+server <- function(input, output, session) {
+  
+  # Reactive dataset from uploaded file
+  dataset <- reactive({
+    req(input$file)
+    
+    # Show progress bar during file upload
+    progress <- Progress$new(session)
+    progress$set(message = "Loading file...", value = 0)
+    
+    # Use fread for efficient reading
+    data <- tryCatch({
+      data.table::fread(input$file$datapath, stringsAsFactors = FALSE)
+    }, error = function(e) {
+      showNotification("Error reading file. Please check the file format.", type = "error")
+      return(NULL)
+    })
+    
+    # Validate the 'timestamp' column
+    if (!("timestamp" %in% names(data))) {
+      stop("The uploaded file must contain a 'timestamp' column.")
+    }
+    
+    # Convert timestamp to POSIXct
+    data[, timestamp := as.POSIXct(timestamp, format = "%Y-%m-%dT%H:%M:%OS", tz = "Asia/Singapore")]
+    
+    # Clean up memory
+    gc()
+    progress$close()
+    data
+  })
+  
+  # Reactive data based on date range and time period
+  filteredData <- reactive({
+    req(dataset())
+    data <- dataset()
+    
+    # Filter by date range
+    data <- data[timestamp >= input$dateRange[1] & timestamp <= input$dateRange[2]]
+    
+    if (nrow(data) == 0) {
+      return(NULL)  # Return NULL if no data is in the selected date range
+    }
+    
+    # Group by time period
+    timePeriod <- input$timePeriod
+    data[, period := switch(
+      timePeriod,
+      day = as.Date(timestamp),
+      week = floor_date(timestamp, "week"),
+      month = floor_date(timestamp, "month")
+    )]
+    data <- data[, .(count = .N), by = period]
+    data
+  })
+  
+  # Reactive data for the table
+  tableData <- reactive({
+    req(filteredData())
+    data <- filteredData()
+    
+    timePeriod <- input$timePeriod
+    if (timePeriod == "month") {
+      data[, `:=`(
+        Year = year(period),
+        Month = format(period, "%b %Y"),  # Format month as "Jan 2022"
+        `Date Range` = paste0(format(period, "%Y-%m-01"), " to ", format(period + months(1) - days(1), "%Y-%m-%d"))
+      )]
+      data <- data[, .(Year, Month, `Date Range`, count)]
+    } else if (timePeriod == "week") {
+      data[, `Date and Year Range` := paste0(format(period, "%Y-%m-%d"), " to ", format(period + weeks(1) - days(1), "%Y-%m-%d"))]
+      data <- data[, .(`Date and Year Range`, count)]
+    } else if (timePeriod == "day") {
+      data[, `Date and Year Range` := as.character(period)]
+      data <- data[, .(`Date and Year Range`, count)]
+    }
+    data
+  })
+  
+  # Render the line chart
+  output$lineChart <- renderPlotly({
+    req(filteredData())
+    data <- filteredData()
+    
+    if (is.null(data) || nrow(data) == 0) {
+      showNotification("No data available for the selected range.", type = "warning")
+      return(NULL)
+    }
+    
+    # Generate the base plot
+    p <- ggplot(data, aes(x = period, y = count)) +
+      geom_line() +
+      geom_point() +
+      labs(
+        title = "Usage Over Time",
+        x = "Time Period",
+        y = "Number of Counts"
+      ) +
+      theme_minimal()
+    
+    # Add horizontal line if input provided, default to 0
+    p <- p + geom_hline(yintercept = input$hline, color = "red", linetype = "dashed")
+    
+    # Adjust Y-axis range dynamically
+    p <- p + coord_cartesian(ylim = input$yAxisRange)
+    
+    ggplotly(p)
+  })
+  
+  # Render the data table
+  output$dataTable <- renderDT({
+    req(tableData())
+    datatable(
+      tableData(),
+      options = list(pageLength = 10, order = list(0, 'asc')),
+      rownames = FALSE
+    )
+  })
+  
+  # Export detailed dataset
+  output$exportDetails <- downloadHandler(
+    filename = function() { paste("Detailed_Dataset_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) {
+      req(dataset())
+      data <- dataset()
+      
+      # Add additional columns to the detailed dataset
+      data[, `:=`(
+        day_of_week = format(timestamp, "%a"),  # Day of the week
+        time = format(timestamp, "%H:%M:%S"),  # Time of day
+        week_period = paste0(
+          format(floor_date(timestamp, "week"), "%Y-%m-%d"), 
+          " to ", 
+          format(floor_date(timestamp, "week") + weeks(1) - days(1), "%Y-%m-%d")
+        )  # Week period
+      )]
+      fwrite(data, file)
+    }
+  )
+  
+  # Export aggregated counts
+  output$exportAggregated <- downloadHandler(
+    filename = function() { paste("Aggregated_Counts_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) {
+      req(tableData())
+      agg_data <- tableData()
+      fwrite(agg_data, file)
+    }
+  )
+}
+
+# Run the app
+shinyApp(ui, server)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
